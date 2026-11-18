@@ -1,0 +1,143 @@
+name: Byg Dictate fra upstream
+
+# Tjekker dagligt om DevEmperor/DictateKeyboard har udgivet en ny version (tag vX.Y.Z).
+# Hvis den ikke allerede findes som release her, bygges og signeres den med din egen nøgle
+# og udgives som release med APK vedhæftet. Obtainium følger dette repo og opdaterer automatisk.
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream-tag at bygge (tom = seneste)"
+        required: false
+      force:
+        description: "Byg igen selvom releasen findes"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM: DevEmperor/DictateKeyboard
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.t.outputs.tag }}
+      build: ${{ steps.t.outputs.build }}
+    steps:
+      - id: t
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh api "repos/$UPSTREAM/releases" --paginate --jq '.[] | select(.draft|not) | select(.prerelease|not) | .tag_name' \
+                  | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          fi
+          echo "Upstream: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && [ "${{ inputs.force }}" != "true" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"; echo "Findes allerede – springer over."
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - name: Hent upstream-kildekode
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ needs.check.outputs.tag }}
+          path: src
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Installer NDK, CMake og build-tools (versioner læses fra upstream)
+        working-directory: src
+        run: |
+          v() { grep "^$1 " gradle/tools.versions.toml | sed -E 's/.*"(.*)".*/\1/'; }
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "ndk;$(v ndk)" "cmake;$(v cmake)" "build-tools;$(v buildTools)" >/dev/null
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+      - name: Hent sherpa-onnx native libs
+        working-directory: src
+        run: bash tools/fetch-sherpa-onnx.sh
+
+      - name: Byg Bergamot (on-device oversættelse, arm64)
+        working-directory: src
+        run: bash tools/bergamot/build-android.sh
+
+      - name: Signeringsnøgle
+        working-directory: src
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          STORE_PW: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PW: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          [ -n "$KEYSTORE_B64" ] || { echo "::error::Secret KEYSTORE_BASE64 mangler"; exit 1; }
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          {
+            echo "storeFile=$RUNNER_TEMP/release.jks"
+            echo "storePassword=$STORE_PW"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PW"
+          } > keystore.properties
+
+      - name: Byg release-APK
+        working-directory: src
+        run: ./gradlew --no-daemon :app:assembleRelease
+
+      - name: Saml APK'er
+        run: |
+          mkdir out
+          for f in src/app/build/outputs/apk/release/*.apk; do
+            n=$(basename "$f" .apk); n=${n#app-}; n=${n%-release}
+            cp "$f" "out/dictate-${TAG}-${n}.apk"
+          done
+          ls -la out
+          ( cd out && sha256sum *.apk > SHA256SUMS.txt )
+
+      - name: Udgiv release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" out/* --repo "$GITHUB_REPOSITORY" \
+            --title "Dictate $TAG (selvbygget)" \
+            --notes "Uændret build af https://github.com/$UPSTREAM/releases/tag/$TAG, signeret med egen nøgle. Licens: Apache-2.0."
+
+  keepalive:
+    # GitHub slår planlagte workflows fra efter 60 dages uden commits. Laver et tomt commit efter 45 dage.
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - run: |
+          last=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - last )) -gt $((45*86400)) ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive"
+            git push
+          fi
